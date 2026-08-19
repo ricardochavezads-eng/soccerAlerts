@@ -3,6 +3,10 @@
 .env.local
 .env.*.local
 
+# Backup files
+*.bak
+*.bak.py
+
 # Python
 __pycache__/
 *.py[cod]
