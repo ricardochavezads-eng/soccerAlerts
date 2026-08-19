@@ -31,6 +31,10 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY", "")
+
+# football-data.org competition codes for our tracked European leagues (no Liga MX on the free tier)
+FOOTBALL_DATA_COMPETITIONS = "PL,PD,SA,BL1,FL1"
 
 # Initialize clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -423,6 +427,108 @@ async def send_telegram_alert(transfer: dict, reliability: float) -> None:
         logger.error(f"Send alert error: {e}")
 
 # ============================================================================
+# LIVE SCORES (football-data.org)
+# ============================================================================
+
+async def send_score_alert(competition: str, home: str, away: str, home_score: int, away_score: int, status: str) -> None:
+    """Send a live score update via Telegram"""
+    try:
+        status_label = {
+            "IN_PLAY": "⏱️ LIVE",
+            "PAUSED": "⏸️ HALF-TIME",
+            "FINISHED": "✅ FULL-TIME",
+        }.get(status, status)
+
+        message = (
+            f"⚽ {status_label}\n\n"
+            f"{home} {home_score} - {away_score} {away}\n"
+            f"🏆 {competition}"
+        )
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, timeout=10)
+            if response.status_code == 200:
+                logger.info(f"Score alert sent: {home} {home_score}-{away_score} {away}")
+            else:
+                logger.error(f"Telegram score alert error: {response.text}")
+
+    except Exception as e:
+        logger.error(f"Send score alert error: {e}")
+
+async def check_live_scores() -> None:
+    """
+    Poll football-data.org for live matches and alert on score/status changes.
+    Note: the free tier only exposes aggregate scores, not individual goal scorers.
+    """
+    if not FOOTBALL_DATA_API_KEY:
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                "https://api.football-data.org/v4/matches",
+                headers={"X-Auth-Token": FOOTBALL_DATA_API_KEY},
+                params={"status": "LIVE", "competitions": FOOTBALL_DATA_COMPETITIONS},
+            )
+
+        if response.status_code != 200:
+            logger.error(f"football-data.org error: {response.status_code} {response.text}")
+            return
+
+        matches = response.json().get("matches", [])
+        logger.info(f"Live scores: {len(matches)} matches in play")
+
+        for match in matches:
+            try:
+                match_id = match["id"]
+                competition = match["competition"]["name"]
+                home = match["homeTeam"].get("shortName") or match["homeTeam"]["name"]
+                away = match["awayTeam"].get("shortName") or match["awayTeam"]["name"]
+                home_score = match["score"]["fullTime"]["home"]
+                away_score = match["score"]["fullTime"]["away"]
+                status = match["status"]
+
+                existing = supabase.table("live_scores").select("*").eq("match_id", match_id).execute()
+                prev = existing.data[0] if existing.data else None
+
+                changed = (
+                    prev is None
+                    or prev["home_score"] != home_score
+                    or prev["away_score"] != away_score
+                    or prev["status"] != status
+                )
+
+                if not changed:
+                    continue
+
+                await send_score_alert(competition, home, away, home_score, away_score, status)
+
+                row = {
+                    "match_id": match_id,
+                    "competition": competition,
+                    "home_team": home,
+                    "away_team": away,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "status": status,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+                if prev:
+                    supabase.table("live_scores").update(row).eq("match_id", match_id).execute()
+                else:
+                    supabase.table("live_scores").insert(row).execute()
+
+            except Exception as e:
+                logger.error(f"Error processing live match: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"check_live_scores error: {e}")
+
+# ============================================================================
 # AGGREGATION JOB
 # ============================================================================
 
@@ -466,18 +572,26 @@ async def aggregate_transfers():
 @app.on_event("startup")
 async def startup_event():
     """Start scheduler on app startup"""
-    # Run aggregation every 4 hours
+    # Run transfer aggregation every 4 hours
     scheduler.add_job(
         aggregate_transfers,
         IntervalTrigger(hours=4),
         id="transfer_aggregation",
     )
-    
+
+    # Poll live scores every 3 minutes (10 req/min quota on football-data.org's free tier)
+    scheduler.add_job(
+        check_live_scores,
+        IntervalTrigger(minutes=3),
+        id="live_scores",
+    )
+
     # Also run immediately on startup
     await aggregate_transfers()
-    
+    await check_live_scores()
+
     scheduler.start()
-    logger.info("Scheduler started - running every 4 hours")
+    logger.info("Scheduler started - transfers every 4h, live scores every 3min")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -549,6 +663,26 @@ async def run_aggregation_manual(background_tasks: BackgroundTasks):
     """Manually trigger aggregation"""
     background_tasks.add_task(aggregate_transfers)
     return {"message": "Aggregation triggered"}
+
+@app.get("/scores")
+async def get_scores():
+    """Get current tracked live/recent match scores"""
+    try:
+        result = supabase.table("live_scores").select("*").order("updated_at", desc=True).execute()
+        return {
+            "count": len(result.data),
+            "matches": result.data,
+            "fetched_at": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Get scores error: {e}")
+        return {"error": str(e), "count": 0, "matches": []}
+
+@app.post("/check-scores")
+async def check_scores_manual(background_tasks: BackgroundTasks):
+    """Manually trigger a live scores poll"""
+    background_tasks.add_task(check_live_scores)
+    return {"message": "Score check triggered"}
 
 @app.post("/init-db")
 async def init_db_endpoint():

@@ -60,6 +60,18 @@ CREATE TABLE IF NOT EXISTS alert_log (
 
 CREATE INDEX idx_alert_log_sent ON alert_log(sent_at DESC);
 
+-- Live match score tracking (state used to detect score/status changes between polls)
+CREATE TABLE IF NOT EXISTS live_scores (
+  match_id BIGINT PRIMARY KEY,
+  competition TEXT,
+  home_team TEXT,
+  away_team TEXT,
+  home_score INTEGER,
+  away_score INTEGER,
+  status TEXT,
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
